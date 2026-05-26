@@ -2445,6 +2445,7 @@ mod tests {
         let wallet_address = wallet.get_new_address().unwrap();
 
         let outpoint = WalletOutPoint {
+            kind: "regular".to_string(),
             txid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             vout: 0,
         };
@@ -2776,6 +2777,7 @@ mod tests {
         let txid = format!("{byte:02x}").repeat(32);
         WalletUtxo {
             outpoint: WalletOutPoint {
+                kind: "regular".to_string(),
                 txid: txid.clone(),
                 vout,
             },
@@ -3112,6 +3114,7 @@ mod tests {
         let mut wallet = native_test_wallet();
         let wallet_address = wallet.get_new_address().unwrap();
         let outpoint = WalletOutPoint {
+            kind: "regular".to_string(),
             txid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             vout: 0,
         };
