@@ -96,6 +96,8 @@ use crate::zmq::ZMQServer;
 const BITASSETS_INDEX_FILE: &str = "bitassets-index.json";
 #[cfg(feature = "bitassets")]
 const BITASSETS_WALLET_FILE: &str = "bitassets-wallet.json";
+#[cfg(feature = "bitassets")]
+const BITASSETS_QUIC_ALPN: &[u8] = b"plain-bitassets-quic-v1";
 
 #[cfg(feature = "bitassets")]
 #[derive(Debug, Deserialize, Serialize)]
@@ -1034,8 +1036,7 @@ impl Florestad {
                     .and_then(Value::as_u64)
                     .ok_or_else(|| "BitAsset content missing amount".to_string())?;
                 (asset_id, Self::bitassets_regular_outpoint(utxo)?, amount, 0)
-            } else if let Some(bitcoin_value) = content.get("BitcoinSats").and_then(Value::as_u64)
-            {
+            } else if let Some(bitcoin_value) = content.get("BitcoinSats").and_then(Value::as_u64) {
                 let outpoint = Self::bitassets_deposit_outpoint(utxo)?;
                 (outpoint.txid, outpoint, 0, bitcoin_value)
             } else {
@@ -1630,10 +1631,11 @@ impl Florestad {
             }
         }
 
-        let crypto = rustls::ClientConfig::builder()
+        let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth();
+        crypto.alpn_protocols = vec![BITASSETS_QUIC_ALPN.to_vec()];
         let client_config = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|err| format!("could not create QUIC rustls client config: {err}"))?;
         Ok(quinn::ClientConfig::new(Arc::new(client_config)))

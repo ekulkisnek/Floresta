@@ -368,8 +368,14 @@ struct StoredAddress {
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct WalletOutPoint {
+    #[serde(default = "default_outpoint_kind")]
+    pub kind: String,
     pub txid: String,
     pub vout: u32,
+}
+
+fn default_outpoint_kind() -> String {
+    "regular".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1418,6 +1424,7 @@ fn parse_outpoints(value: Option<&Value>) -> Result<Vec<WalletOutPoint>, Error> 
 
 fn validate_loaded_outpoint(outpoint: &WalletOutPoint) -> Result<(), Error> {
     validate_hash_hex("wallet outpoint txid", &outpoint.txid)?;
+    validate_outpoint_kind(&outpoint.kind)?;
     Ok(())
 }
 
@@ -1447,7 +1454,9 @@ fn validate_loaded_utxo(
         validate_loaded_proof_ref(proof_ref)?;
     }
     if confirmed {
-        validate_confirmed_proof_refs(&utxo.outpoint, &utxo.proof_refs)?;
+        if outpoint_requires_proof_refs(&utxo.outpoint) {
+            validate_confirmed_proof_refs(&utxo.outpoint, &utxo.proof_refs)?;
+        }
         let leaf_hash = utxo.utreexo_leaf_hash.as_deref().ok_or_else(|| {
             Error::UtreexoProof(format!(
                 "{} missing persisted leaf hash",
@@ -1462,23 +1471,59 @@ fn validate_loaded_utxo(
 }
 
 fn parse_outpoint(value: &Value) -> Result<WalletOutPoint, Error> {
-    let regular = value
-        .get("Regular")
-        .ok_or_else(|| Error::Rpc("lite wallet V1 only supports regular outpoints".to_string()))?;
-    let txid = regular
+    if let Some(regular) = value.get("Regular") {
+        return parse_tagged_outpoint("regular", regular);
+    }
+    if let Some(deposit) = value.get("Deposit") {
+        return parse_deposit_outpoint(deposit);
+    }
+    Err(Error::Rpc(
+        "lite wallet V1 only supports regular or deposit outpoints".to_string(),
+    ))
+}
+
+fn parse_tagged_outpoint(kind: &str, value: &Value) -> Result<WalletOutPoint, Error> {
+    let txid = value
         .get("txid")
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::Rpc("regular outpoint missing txid".to_string()))?
+        .ok_or_else(|| Error::Rpc(format!("{kind} outpoint missing txid")))?
         .to_string();
-    let vout = regular
+    let vout = value
         .get("vout")
         .and_then(Value::as_u64)
-        .ok_or_else(|| Error::Rpc("regular outpoint missing vout".to_string()))?;
+        .ok_or_else(|| Error::Rpc(format!("{kind} outpoint missing vout")))?;
     Ok(WalletOutPoint {
-        txid: validate_hash_hex("regular outpoint txid", &txid)?,
+        kind: kind.to_string(),
+        txid: validate_hash_hex(&format!("{kind} outpoint txid"), &txid)?,
         vout: u32::try_from(vout)
-            .map_err(|_| Error::Rpc("regular outpoint vout overflow".to_string()))?,
+            .map_err(|_| Error::Rpc(format!("{kind} outpoint vout overflow")))?,
     })
+}
+
+fn parse_deposit_outpoint(value: &Value) -> Result<WalletOutPoint, Error> {
+    if let Some(value) = value.as_str() {
+        let (txid, vout) = value
+            .split_once(':')
+            .ok_or_else(|| Error::Rpc("deposit outpoint missing separator".to_string()))?;
+        let vout = vout
+            .parse::<u32>()
+            .map_err(|err| Error::Rpc(format!("invalid deposit outpoint vout: {err}")))?;
+        return Ok(WalletOutPoint {
+            kind: "deposit".to_string(),
+            txid: validate_hash_hex("deposit outpoint txid", txid)?,
+            vout,
+        });
+    }
+    parse_tagged_outpoint("deposit", value)
+}
+
+fn validate_outpoint_kind(kind: &str) -> Result<(), Error> {
+    match kind {
+        "regular" | "deposit" => Ok(()),
+        _ => Err(Error::Rpc(format!(
+            "unsupported wallet outpoint kind {kind}"
+        ))),
+    }
 }
 
 fn optional_array<'a>(
@@ -1612,7 +1657,7 @@ fn parse_node_hash(hex_hash: &str) -> Result<BitcoinNodeHash, Error> {
 }
 
 fn format_outpoint(outpoint: &WalletOutPoint) -> String {
-    format!("regular {} {}", outpoint.txid, outpoint.vout)
+    format!("{} {} {}", outpoint.kind, outpoint.txid, outpoint.vout)
 }
 
 fn lite_wallet_leaf_hash(
@@ -1829,13 +1874,19 @@ fn parse_utxo(
     if parsed_content.content_kind == "unsupported" {
         return Ok(None);
     }
-    let refs = proof_refs
-        .iter()
-        .filter(|proof| proof.txid == outpoint.txid)
-        .cloned()
-        .collect::<Vec<_>>();
+    let refs = if outpoint_requires_proof_refs(&outpoint) {
+        proof_refs
+            .iter()
+            .filter(|proof| proof.txid == outpoint.txid)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let utreexo_leaf_hash = if confirmed {
-        validate_confirmed_proof_refs(&outpoint, &refs)?;
+        if outpoint_requires_proof_refs(&outpoint) {
+            validate_confirmed_proof_refs(&outpoint, &refs)?;
+        }
         let view = utreexo_view
             .ok_or_else(|| Error::Rpc("confirmed UTXO missing Utreexo view".to_string()))?;
         let proof = view
@@ -1843,9 +1894,14 @@ fn parse_utxo(
             .iter()
             .find(|proof| proof.outpoint == outpoint)
             .ok_or_else(|| Error::UtreexoProof(format_outpoint(&outpoint)))?;
-        let proof_ref = refs
-            .first()
-            .ok_or_else(|| Error::UtreexoProof(format_outpoint(&outpoint)))?;
+        let default_proof_ref;
+        let proof_ref = if outpoint_requires_proof_refs(&outpoint) {
+            refs.first()
+                .ok_or_else(|| Error::UtreexoProof(format_outpoint(&outpoint)))?
+        } else {
+            default_proof_ref = default_proof_ref_for_outpoint(&outpoint);
+            &default_proof_ref
+        };
         let expected_leaf_hash = lite_wallet_leaf_hash(
             &outpoint,
             &address,
@@ -1897,6 +1953,24 @@ fn validate_confirmed_proof_refs(
         }
     }
     Ok(())
+}
+
+fn outpoint_requires_proof_refs(outpoint: &WalletOutPoint) -> bool {
+    outpoint.kind == "regular"
+}
+
+fn default_proof_ref_for_outpoint(outpoint: &WalletOutPoint) -> WalletProofRef {
+    WalletProofRef {
+        txid: if outpoint.kind == "regular" {
+            outpoint.txid.clone()
+        } else {
+            "00".repeat(32)
+        },
+        block_hash: None,
+        sidechain_block_height: None,
+        bmm_inclusions: Vec::new(),
+        best_main_verification: None,
+    }
 }
 
 fn parse_proof_refs(value: Option<&Value>) -> Result<Vec<WalletProofRef>, Error> {
@@ -2002,11 +2076,18 @@ fn reject_same_asset_pair(asset0: &AssetId, asset1: &AssetId) -> Result<(), Erro
 fn selected_to_outpoints(selected: &[WalletUtxo]) -> Result<Vec<OutPoint>, Error> {
     selected
         .iter()
-        .map(|utxo| {
-            Ok(OutPoint::Regular {
+        .map(|utxo| match utxo.outpoint.kind.as_str() {
+            "regular" => Ok(OutPoint::Regular {
                 txid: Txid(Hash::from_hex(&utxo.outpoint.txid)?),
                 vout: utxo.outpoint.vout,
-            })
+            }),
+            "deposit" => Ok(OutPoint::Deposit(BitcoinOutPoint {
+                txid: Hash::from_hex(&utxo.outpoint.txid)?.0,
+                vout: utxo.outpoint.vout,
+            })),
+            kind => Err(Error::Rpc(format!(
+                "unsupported wallet outpoint kind {kind}"
+            ))),
         })
         .collect()
 }

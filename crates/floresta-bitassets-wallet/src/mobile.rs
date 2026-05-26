@@ -11,6 +11,8 @@ use tokio::io::AsyncReadExt as _;
 
 use crate::{parse_asset_id, BitAssetData, DutchAuctionParams, Error, NativeBitAssetsWallet};
 
+const BITASSETS_QUIC_ALPN: &[u8] = b"plain-bitassets-quic-v1";
+
 #[derive(Debug, Deserialize)]
 pub struct EmbeddedWalletConfig {
     pub path: PathBuf,
@@ -350,10 +352,11 @@ fn bitassets_quic_client_config() -> Result<quinn::ClientConfig, Error> {
         }
     }
 
-    let crypto = rustls::ClientConfig::builder()
+    let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
+    crypto.alpn_protocols = vec![BITASSETS_QUIC_ALPN.to_vec()];
     let client_config = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|err| Error::Rpc(format!("could not create QUIC rustls client config: {err}")))?;
     Ok(quinn::ClientConfig::new(Arc::new(client_config)))
