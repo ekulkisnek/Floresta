@@ -19,6 +19,7 @@ pub struct RpcRequest {
     pub method: String,
 
     /// The parameters for the method, as an array of json values.
+    #[serde(default)]
     pub params: Vec<Value>,
 
     /// An optional identifier for the request, which can be used to match responses.
