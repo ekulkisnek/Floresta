@@ -543,11 +543,30 @@ impl Florestad {
         let cfilters = None;
 
         // If this network already allows pow fraud proofs, we should use it instead of assumeutreexo
-        let assume_utreexo = match self.config.assume_utreexo {
+        let mut assume_utreexo = match self.config.assume_utreexo {
             true => Some(ChainParams::get_assume_utreexo(self.config.network)),
 
             _ => None,
         };
+
+        #[cfg(feature = "bitassets")]
+        if let Some(rpc_url) = self.config.bitassets_rpc_url.as_ref() {
+            match Self::fetch_utreexo_anchors(rpc_url) {
+                Ok(anchors) => {
+                    info!(
+                        "Discovered utreexo anchors from plain-bitassets RPC at {} (height {})",
+                        rpc_url, anchors.height
+                    );
+                    assume_utreexo = Some(anchors);
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not discover utreexo anchors from plain-bitassets RPC at {}: {e}",
+                        rpc_url
+                    );
+                }
+            }
+        }
 
         let proxy = self
             .config
@@ -1037,7 +1056,13 @@ impl Florestad {
                     .ok_or_else(|| "BitAsset content missing amount".to_string())?;
                 (asset_id, Self::bitassets_regular_outpoint(utxo)?, amount, 0)
             } else if let Some(bitcoin_value) = content.get("BitcoinSats").and_then(Value::as_u64) {
-                let outpoint = Self::bitassets_deposit_outpoint(utxo)?;
+                let outpoint = if utxo.pointer("/outpoint/Deposit").is_some() {
+                    Self::bitassets_deposit_outpoint(utxo)?
+                } else if utxo.pointer("/outpoint/Regular").is_some() {
+                    Self::bitassets_regular_outpoint(utxo)?
+                } else {
+                    continue;
+                };
                 (outpoint.txid, outpoint, 0, bitcoin_value)
             } else {
                 continue;
@@ -1639,6 +1664,50 @@ impl Florestad {
         let client_config = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|err| format!("could not create QUIC rustls client config: {err}"))?;
         Ok(quinn::ClientConfig::new(Arc::new(client_config)))
+    }
+
+    #[cfg(feature = "bitassets")]
+    fn fetch_utreexo_anchors(rpc_url: &str) -> Result<AssumeUtreexoValue, String> {
+        let url = if rpc_url.contains("://") {
+            rpc_url.to_owned()
+        } else {
+            format!("http://{}", rpc_url)
+        };
+        let result = Self::bitassets_rpc_call(&url, "private_signet_utreexo_anchors")?;
+        let height = result
+            .get("height")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "missing height in utreexo anchors".to_string())?
+            as u32;
+        let block_hash: bitcoin::BlockHash = result
+            .get("block_hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing block_hash".to_string())?
+            .parse()
+            .map_err(|e| format!("invalid block_hash: {e}"))?;
+        let leaves = result
+            .get("leaves")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "missing leaves".to_string())?;
+        let roots_val = result
+            .get("roots")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "missing roots".to_string())?;
+        let mut roots = Vec::with_capacity(roots_val.len());
+        for r in roots_val {
+            let hex_str = r.as_str().ok_or_else(|| "root not a string".to_string())?;
+            let bytes: [u8; 32] = hex::decode(hex_str)
+                .map_err(|e| format!("invalid root hex {hex_str}: {e}"))?
+                .try_into()
+                .map_err(|_| format!("root hex wrong length: {hex_str}"))?;
+            roots.push(rustreexo::node_hash::BitcoinNodeHash::Some(bytes));
+        }
+        Ok(AssumeUtreexoValue {
+            height,
+            block_hash,
+            roots,
+            leaves,
+        })
     }
 
     /// Setup the wallet by initializing the database and adding descriptors, xpubs, and addresses.
